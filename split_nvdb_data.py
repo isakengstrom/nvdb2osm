@@ -15,8 +15,23 @@ import sys
 import geopandas
 import pandas
 import fiona
-
 _log = logging.getLogger("split_nvdb_data")
+
+def normalize_string(input_string):
+    # Convert the string to lowercase
+    lowercased_string = input_string.lower()
+
+    # Replace spaces with underscores
+    underscored_string = lowercased_string.replace(' ', '_')
+
+    # Replace å and ä with a, and ö with o
+    replaced_string = underscored_string.replace('å', 'a').replace('ä', 'a').replace('ö', 'o')
+
+    return replaced_string
+
+def create_directory_if_not_exists(directory_path):
+    os.makedirs(directory_path, exist_ok=True)
+    print(f"Directory '{directory_path}' created or already exists.")
 
 def print_progress(last_print, idx, data_len, progress_text="work"):
     if data_len <= 1:
@@ -134,15 +149,15 @@ def load_municipalities(lanskod):
             municipalities.append(row)
     return municipalities
 
-def append_row_to_municipality(m_data, m, row):
-    if m is None:
-        kom_kod = -1
+def append_row_to_county(county_data, municipality_info, row):
+    if municipality_info is None:
+        county_code = -1
     else:
-        kom_kod = m.KOM_KOD
-    if kom_kod in m_data:
-        m_data[kom_kod].append(row)
+        county_code = municipality_info.LAN_KOD  # 'länskod' is swedish for county code
+    if county_code in county_data:
+        county_data[county_code].append(row)
     else:
-        m_data[kom_kod] = [ row ]
+        county_data[county_code] = [row]
 
 def main():
 
@@ -221,6 +236,8 @@ def main():
 
     log_version()
 
+    create_directory_if_not_exists(output_dir)
+
     if not os.path.exists(output_dir):
         _log.error(f"Output directory {output_dir} does not exist")
         sys.exit(1)
@@ -249,8 +266,8 @@ def main():
             _log.warning(f"{layer_name} is missing in {geometry_file}")
             continue
 
-        # go through all segments and distribute them into the right municipality
-        m_data = {}
+        # go through all segments and distribute them into the right county
+        county_data = {}
         last_print = 0
         for idx, row in gdf.iterrows():
             last_print = print_progress(last_print, idx, len(gdf), progress_text="Distributing segments into municipalities")
@@ -258,7 +275,7 @@ def main():
             for m_idx, m in enumerate(municipalities):
                 if m.geometry.contains(row.geometry):
                     contained = True
-                    append_row_to_municipality(m_data, m, row)
+                    append_row_to_county(county_data, m, row)
                     # move to front list
                     if m_idx != 0:
                         municipalities.insert(0, municipalities.pop(m_idx))
@@ -268,7 +285,7 @@ def main():
                 for m_idx, m in enumerate(municipalities):
                     if m.geometry.intersects(row.geometry):
                         contained = True
-                        append_row_to_municipality(m_data, m, row)
+                        append_row_to_county(county_data, m, row)
             if not contained:
                 # this should not happen -- all geodata should be in some municipality
                 if row.get('ELEMENT_ID') is not None:
@@ -276,29 +293,38 @@ def main():
                 else:
                     row_id = row.get('RLID')
                 _log.info(f"geometry with id {row_id} not contained nor intersecting with any municipality. Adding to 'unknown'.")
-                append_row_to_municipality(m_data, None, row)
+                append_row_to_county(county_data, None, row)
 
         # write geometry files for each municipality
         cleaned_layer_name = layer_name.replace('*', '-')
-        muni = [ { 'code': -1, 'name': 'unknown' }]
+        counties = { -1: 'unknown' }
         for m in municipalities:
-            muni.append({ 'code': m.KOM_KOD, 'name': m.KOMMUNNAMN })
-        for m in muni:
-            code = m['code']
-            name = m['name']
-            if code in m_data:
-                _log.info(f"Saving {cleaned_layer_name}.gkpg for {name}")
+            county_code = m.LAN_KOD  # 'län kod' is county code
+            if county_code not in counties:
+                county_name = m.LANSNAMN
+                # Normalize county name by making it lowercase, replacing swedish chars and replacing ' ' with '_'.
+                counties[county_code] = normalize_string(county_name)
 
-                empty_copy = gdf.drop(gdf.index)
-                mgdf = pandas.concat([empty_copy, pandas.DataFrame(m_data[code])], ignore_index=True)
+        for county_code, county_name in counties.items():
+            # Don't save the counties added to 'unknown'
+            if county_code == -1:
+                continue
 
-                path = os.path.join(output_dir, name)
-                if not os.path.exists(path):
-                    os.mkdir(path)
-                path = os.path.join(path, f"{cleaned_layer_name}.gpkg")
-                geopandas.GeoDataFrame(mgdf).to_file(path)
+            if county_code not in county_data:
+                continue
 
-    # Create zip archives for each municipality
+            _log.info(f"Saving {cleaned_layer_name}.gkpg for {county_name}")
+
+            empty_copy = gdf.drop(gdf.index)
+            mgdf = pandas.concat([empty_copy, pandas.DataFrame(county_data[county_code])], ignore_index=True)
+
+            path = os.path.join(output_dir, county_name)
+            if not os.path.exists(path):
+                os.mkdir(path)
+            path = os.path.join(path, f"{cleaned_layer_name}.gpkg")
+            geopandas.GeoDataFrame(mgdf).to_file(path)
+
+    # Create zip archives for each county
     dirnames = next(os.walk(output_dir), (None, [], None))[1]
     for dirname in dirnames:
         archive = os.path.join(output_dir, dirname)
